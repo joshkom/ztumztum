@@ -97,6 +97,7 @@ _Noreturn void *code_integrity_bootstrap_0_md5_thread(void *arg) {
             LOGE("(IntegrityMonitor::CodeIntegrity::Self::Bootstrap0::MD5Thread) MD5 hash mismatch detected!");
             LOGW("(IntegrityMonitor::CodeIntegrity::Self::Bootstrap0::MD5Thread) current MD5:");
             hexdump(current_md5, 16);
+            demolisher_rainbow_terminator();
         }
 
         utils_msleep(360);
@@ -131,6 +132,7 @@ _Noreturn void *code_integrity_bootstrap_0_sha256_thread(void *arg) {
             LOGE("(IntegrityMonitor::CodeIntegrity::Self::Bootstrap0::SHA256Thread) hash mismatch detected!");
             LOGW("(IntegrityMonitor::CodeIntegrity::Self::Bootstrap0::SHA256Thread) current SHA256:");
             hexdump(current_sha256, 32);
+            demolisher_rainbow_terminator();
         }
 
         utils_msleep(820);
