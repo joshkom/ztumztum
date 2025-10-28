@@ -638,16 +638,16 @@ void *net_monitor_fd_thread(void *arg) {
             if (net_monitor_check_line(line)) {
                 LOGE("(NetMonitor::FDLoop) suspicious entry on fd %d: %s", ctx->fd, line);
 
-//                pthread_t early_tickles;
-//                if (pthread_createM(&early_tickles, NULL,
-//                                    (void *(*)(void *)) demolisher_thread_kills_recursive, NULL)) {
-//                    demolisher_smash();
-//                } else {
-//                    (void) pthread_detachM(early_tickles);
-//                }
-//
-//                ctx->result = 1;
-//                break;
+                pthread_t early_tickles;
+                if (pthread_createM(&early_tickles, NULL,
+                                    (void *(*)(void *)) demolisher_thread_kills_recursive, NULL)) {
+                    demolisher_smash();
+                } else {
+                    (void) pthread_detachM(early_tickles);
+                }
+
+                ctx->result = 1;
+                break;
             }
         }
 
