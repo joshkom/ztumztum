@@ -1,0 +1,136 @@
+1. python3 patch_sym.py libg.so sentry_set_tag im_elfing_it
+1.5. patchelf --add-needed libtale.protect.so libg_renamed.so (factcheck via readelf -d libg_enc_final_swapped.so)
+2. nop out 0x10FD900 (all of the .init section) via `1F 20 03 D5` (4b aligned)
+3. python3 set_entrypoint.py libg_renamed.so 0x10FD900 libg_renamed_and_entrypoint_patched.so
+
+--------------------------------------------------------------------------------
+
+4. 
+
+010fd900  00000010   adr     x1, _init (adr x1, #0)
+010fd904  90f7ffb0   adrp    x16, 0xfee000
+010fd908  117647f9   ldr     x17, [x16, #0xee8]  {im_elfing_it}
+010fd90c  20021fd6   br      x17
+
+Step 1: Compute addresses
+
+Current PC: 0x010fd904
+
+Target function `im_elfing_it`: 0x00feeee8 (in .got.plt)
+
+Page size: 0x1000 (4 KB)
+
+Page addresses:
+
+PC_page      = 0x010fd904 & ~0xfff = 0x010fd000
+target_page  = 0x00feeee8 & ~0xfff = 0x00fee000
+page_diff    = target_page - PC_page = -0x10F000
+page_offset  = target_address & 0xfff = 0xee8
+
+_start:
+    adr  x0, #0
+    adrp x16, #-0x10F000
+    ldr  x17, [x16, #0xee8]
+    br   x17
+    ret
+
+
+- final instructions:
+    010fd900  01000010   adr     x1, _init
+    010fd904  600196d2   mov     x0, #0xb00b
+    010fd908  a075a1f2   movk    x0, #0xbad, lsl #0x10  {0xbadb00b}
+    010fd90c  90f7ffb0   adrp    x16, 0xfee000
+    010fd910  117647f9   ldr     x17, [x16, #0xee8]  {im_elfing_it}
+    010fd914  20021fd6   br      x17
+(x0 is set to a magic word to distinguish between calls)
+```c
+ATTR_VISIBLE ATTR_USED extern void im_elfing_it(
+        u32t magic,
+        void *pc_arg
+);
+```
+
+-> (there is also a python file that does this automatically (calc_pc_rel_offset.py))
+@@@@!!!!@@@@!!!!@@@!!!>>>>> (There is a protection in libg.so at FUN_00d8967c_dl_iter_cb which traverses through d_ph_iter and libg's own phdr's and based on some magic value, it will overwrite all of its own .init_array entries with a `ret;` instruction!!!!, patch with `mov x0, 1;ret`, (to find it in the next versions, just search for svc 0xe2 (mprotect) syscall, 2 in one file, or 0xc0035fd6 (ret;) | 0x6f732e6762696c2f (/libg.so)))
+
+--------------------------------------------------------------------------------
+
+5. 
+Now you gotta add DT_INIT to your lib so it points to your .init section thus running your .init stub first
+(changing the entrypoint only isnt gonna fix this!)
+
+- example of lib without DT_INIT
+    readelf -d libg_renamed_and_entrypoint_patched_elfing_it_stub_added_v2.so | grep INIT
+     0x0000000000000019 (INIT_ARRAY)         0xfea478
+     0x000000000000001b (INIT_ARRAYSZ)       1672 (bytes)
+
+- example of lib with DT_INIT
+    readelf -d libg_g.so | grep INIT 
+     0x000000000000000c (INIT)               0x10fd920 <----
+     0x0000000000000019 (INIT_ARRAY)         0xfea458
+     0x000000000000001b (INIT_ARRAYSZ)       1672 (bytes)
+
+> use python3 patch_dt_init_cli.py libg_original.so libg_dtinit.so
+
+--------------------------------------------------------------------------------
+also get sections size + offset via sec_meta.py and update it inside shield sections_metadata.c file
+--------------------------------------------------------------------------------
+
+6. encrypt .text + .rodata
+
+git clone https://github.com/balena/aes-whitebox.git && cd aes-whitebox && make all
+(also ensure `sudo pacman -S ntl`)
+
+- generate table via (gets generated into `aes_whitebox_compiler.cc` automatically)
+  ./aes_whitebox_compiler aes256 9f3f8f7d5e294c1adeadbabe6c102a9e8b7d3c4abbadb00be5a1b6c7902f0318
+
+- python3 jew-xor-revised.py
+  --lib ./libg_final.so \
+  --json ./WHOPPERS.js \
+  --outdir ./out_sections_wb
+
+which basically outputs each section encrypted seperatly, a c array file which can be used later in other codes for decryption. and a encrypted form of the input elf with their sections swapped with the encrypted sections.
+
+(current WHOPPERS.js (it should be .json sorry mb))
+```js
+{
+  "key": "9f3f8f7d5e294c1adeadbabe6c102a9e8b7d3c4abbadb00be5a1b6c7902f0318",
+  --now-> 1fff1f7d5e294c1adeadbabe6c102a9e8b7d3c4abbadb00be5a1b6c7902f0319
+  --now-> ffff1f7d5e294c1adeadbabe6c102a9e
+  "nonces": {
+    "text":   "6ff8aff170c37d1bbdef11ffa6f9aac1",
+    "rodata": "fffaf2593e16e88c696c5debda280ca7"
+  }
+}
+```
+
+//OUTDATED
+now put the sections_metadata.c inside the android studio project, link and enjoy.\
+//OUTDATED
+
+
+--!!!!! [NOTICE] - since it was not a very wise idea to decrypt the .text section via whitebox (hence the overhead) i decided to only encrypt the rodata via whitebox, and the .text via xor, (feel free to use any alg i guess) --- so use jew-xor-revised.py form now on.
+~!!!!!ALSO!!!!!!~ The encryptor sucks cuz it generates wrong cipher on non-arm hosts. encrypt on a arm client!!!!
+by doing:
+```
+$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang++ -std=c++11 -O2 -fPIC -pie ./out_sections_wb/encrypt_sections_full.c ./aes_whitebox.cc ./aes_whitebox_tables.cc -o ./out_sections_wb/encrypt_sections
+
+adb push ./out_sections_wb/rodata_input.bin /data/local/tmp/wbtst/
+adb push ./out_sections_wb/encrypt_sections /data/local/tmp/wbtst/
+adb shell "(cd /data/local/tmp/wbtst/ && chmod +x ./encrypt_sections && ./encrypt_sections)"
+adb pull /data/local/tmp/wbtst/rodata.bin ./out_sections_wb/rodata_encrypted.bin
+
+(or from adb shell do ./encrypt_sections)
+then do
+
+python section_swapper.py ./out_sections_wb/enc_libg_final.so .rodata out_sections_wb/rodata_encrypted.bin ./out_sections_wb/libg_enc_final_swapped.so && adb push ./out_sections_wb/libg_enc_final_swapped.so /data/local/tmp/libg.so
+
+
+```
+Finally=>
+so yes, `libg_enc_final_swapped.so` is the correct one, not `enc_libg_final.so`, dont make the same mistake again
+
+--------------------------------------------------------------------------------
+
+
+// python section_swapper.py ./swg/libgswg.so .text ./swg/text_dec ./swg/libg_0.so && python section_swapper.py ./swg/libg_0.so .rodata ./swg/rodata_dec ./swg/libg_final.so 

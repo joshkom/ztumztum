@@ -1,0 +1,315 @@
+#include "segment_resolver.h"
+#include "global_common/common.h"
+#include "TaleProtect/func_resolver/func_resolver_3000.h"
+#include <link.h>
+#include <dlfcn.h>
+#include <unstdstring_compat.h>
+
+typedef struct {
+    const i8 *lib_name;
+    segments_t *seg;
+    u8t pt_load_only;
+} phdr_callback_data;
+
+i32 phdr_callback(struct dl_phdr_info *info, sizet size, void *arg) {
+    phdr_callback_data *d = (phdr_callback_data *) arg;
+
+    if (!info->dlpi_name || !unstdstring_compat_strstr(info->dlpi_name, d->lib_name)) {
+        return 0;
+    }
+
+    u8t *base = (u8t *) info->dlpi_addr;
+    for (int i = 0; i < info->dlpi_phnum; i++) {
+        const Elf64_Phdr *p = &info->dlpi_phdr[i];
+
+        if (d->pt_load_only && p->p_type != PT_LOAD) {
+            continue;
+        }
+
+        u8t *seg_start = base + p->p_vaddr;
+        sizet seg_size = p->p_memsz;
+
+        LOGI("PHDR[%d]: type=%d, flags=0x%x, start=%p, size=%zu",
+             i, p->p_type, p->p_flags, (void *) seg_start, seg_size);
+
+        if ((p->p_flags & PF_X) && !d->seg->exec.start) {
+            d->seg->exec.start = seg_start;
+            d->seg->exec.size = seg_size;
+        }
+
+        if ((p->p_flags & PF_R) && !(p->p_flags & PF_W) && !(p->p_flags & PF_X)) {
+            if (d->seg->ro_count < MAX_RO_SEGMENTS) {
+                d->seg->ro[d->seg->ro_count].start = seg_start;
+                d->seg->ro[d->seg->ro_count].size = seg_size;
+                d->seg->ro_count++;
+            }
+        }
+    }
+
+    return 1;
+}
+
+segments_t get_segments(void *dummy_func_ptr_arg) {
+    segments_t seg = {0};
+
+    Dl_info info;
+    if (!dladdrM(dummy_func_ptr_arg, &info) || !info.dli_fbase) {
+        return seg;
+    }
+
+    u8t *base = (u8t *) info.dli_fbase;
+    seg.base = base;
+
+    Elf64_Ehdr *ehdr = (Elf64_Ehdr *) base;
+    Elf64_Phdr *phdr = (Elf64_Phdr *) (base + ehdr->e_phoff);
+
+    for (int i = 0; i < ehdr->e_phnum; ++i) {
+        u8t *seg_start = base + phdr[i].p_vaddr;
+        sizet seg_size = phdr[i].p_memsz;
+
+        LOGI("PHDR[%d]: type=%d, flags=0x%x, start=%p, size=%zu",
+             i, phdr[i].p_type, phdr[i].p_flags, seg_start, seg_size);
+
+        // [exec segment]
+        if (!seg.exec.start && (phdr[i].p_flags & PF_X) && phdr[i].p_type == PT_LOAD) {
+            seg.exec.start = seg_start;
+            seg.exec.size = seg_size;
+            seg.end_of_exec = (seg_start + seg_size);  // base + end of exec
+            LOGI(" -> chosen as exec segment (start=%p, size=%zu, end=%p)",
+                 seg.exec.start, seg.exec.size, (u8t *) seg.end_of_exec);
+        }
+
+        // [read-only segments (R && !W && !X)]
+        if ((phdr[i].p_flags & PF_R) && !(phdr[i].p_flags & PF_W) && !(phdr[i].p_flags & PF_X)) {
+            if (seg.ro_count < MAX_RO_SEGMENTS) {
+                seg.ro[seg.ro_count].start = seg_start;
+                seg.ro[seg.ro_count].size = seg_size;
+                LOGI(" -> added RO segment[%d]: start=%p, size=%zu",
+                     seg.ro_count, seg_start, seg_size);
+                seg.ro_count++;
+            }
+        }
+    }
+
+    LOGI("(SegmentResolver::GetSegments) Final segments: base=%p, exec=%p/%zu, end_of_exec=%p, ro_count=%d | hash_to_calc_size:0x%lx",
+         seg.base, seg.exec.start, seg.exec.size, seg.end_of_exec, seg.ro_count,
+         seg.end_of_exec - seg.base);
+
+    for (int i = 0; i < seg.ro_count; i++) {
+        LOGI("  RO[%d]: start=%p, size=%zu", i, seg.ro[i].start, seg.ro[i].size);
+    }
+
+    return seg;
+}
+
+//segments_t get_segments(void *dummy_func_ptr_arg) {
+//    segments_t seg = {0};
+//
+//    Dl_info info;
+//    if (!dladdrM(dummy_func_ptr_arg, &info) || !info.dli_fbase) {
+//        return seg;
+//    }
+//
+//    u8t *base = (u8t *) info.dli_fbase;
+//    Elf64_Ehdr *ehdr = (Elf64_Ehdr *) base;
+//    Elf64_Phdr *phdr = (Elf64_Phdr *) (base + ehdr->e_phoff);
+//
+//    for (int i = 0; i < ehdr->e_phnum; ++i) {
+//        u8t *seg_start = base + phdr[i].p_vaddr;
+//        sizet seg_size = phdr[i].p_memsz;
+//
+//        LOGI("PHDR[%d]: type=%d, flags=0x%x, start=%p, size=%zu",
+//             i, phdr[i].p_type, phdr[i].p_flags, seg_start, seg_size);
+//
+//        // [exec segment]
+//        if (!seg.exec.start && (phdr[i].p_flags & PF_X) && phdr[i].p_type == PT_LOAD) {
+//            seg.exec.start = seg_start;
+//            seg.exec.size = seg_size;
+//            LOGI(" -> chosen as exec segment");
+//        }
+//
+//        // [read-only segment(s) (R && !W/X)]
+//        if ((phdr[i].p_flags & PF_R) && !(phdr[i].p_flags & PF_W) && !(phdr[i].p_flags & PF_X)) {
+//            if (seg.ro_count < MAX_RO_SEGMENTS) {
+//                seg.ro[seg.ro_count].start = seg_start;
+//                seg.ro[seg.ro_count].size = seg_size;
+//                LOGI(" -> added RO segment[%d]", seg.ro_count);
+//                seg.ro_count++;
+//            }
+//        }
+//    }
+//
+//    LOGI("Final segments: exec=%p/%zu, ro_count=%d",
+//         seg.exec.start, seg.exec.size, seg.ro_count);
+//
+//    for (int i = 0; i < seg.ro_count; i++) {
+//        LOGI("  RO[%d]: start=%p, size=%zu", i, seg.ro[i].start, seg.ro[i].size);
+//    }
+//
+//    return seg;
+//}
+
+segments_t get_segments_ext(const char *lib_name_arg,
+                            seg_search_mode_t mode_arg,
+                            u8t pt_load_only_arg /* 0 = include all, 1 = only PT_LOAD */) {
+    segments_t seg = {0};
+
+    if (!lib_name_arg) {
+        return seg;
+    }
+
+    if (mode_arg == SEG_SEARCH_MAPS) {
+        // --- /proc/self/maps mode_arg ---
+        FILE *maps = fopen("/proc/self/maps", "r");
+        if (!maps) return seg;
+
+        char line[512];
+        while (fgets(line, sizeof(line), maps)) {
+            unsigned long start, end;
+            char perms[5], path[256] = {0};
+
+            if (sscanf(line, "%lx-%lx %4s %*x %*x:%*x %*d %255s",
+                       &start, &end, perms, path) < 3)
+                continue;
+
+            if (strstr(path, lib_name_arg)) {
+                u8t *seg_start = (u8t *) start;
+                sizet seg_size = end - start;
+
+                if (perms[0] == 'r' && perms[1] != 'w' && perms[2] != 'x') {
+                    if (seg.ro_count < MAX_RO_SEGMENTS) {
+                        seg.ro[seg.ro_count].start = seg_start;
+                        seg.ro[seg.ro_count].size = seg_size;
+                        seg.ro_count++;
+                    }
+                } else if (perms[2] == 'x') {
+                    if (!seg.exec.start) {
+                        seg.exec.start = seg_start;
+                        seg.exec.size = seg_size;
+                    }
+                }
+            }
+        }
+        fclose(maps);
+
+    } else if (mode_arg == SEG_SEARCH_PHDR) {
+        // --- dl_iterate_phdr mode_arg ---
+        phdr_callback_data data = {lib_name_arg, &seg, pt_load_only_arg};
+        dl_iterate_phdrM(phdr_callback, &data);
+    } else if (mode_arg == SEG_SEARCH_MAPS_DLADDR) {
+        // --- find exec segment via /proc/self/maps ---
+        FILE *maps = fopen("/proc/self/maps", "r");
+        if (!maps) return seg;
+
+        u8t *exec_addr = NULL;
+        char line[512];
+        while (fgets(line, sizeof(line), maps)) {
+            unsigned long start, end;
+            char perms[5], path[256] = {0};
+
+            if (sscanf(line, "%lx-%lx %4s %*x %*x:%*x %*d %255s",
+                       &start, &end, perms, path) < 3)
+                continue;
+
+            if (strstr(path, lib_name_arg) && perms[2] == 'x') {
+                exec_addr = (u8t *) start;
+                break;
+            }
+        }
+
+        fclose(maps);
+
+        if (exec_addr) {
+            Dl_info info;
+            if (dladdrM(exec_addr, &info) && info.dli_fbase) {
+                u8t *base = (u8t *) info.dli_fbase;
+                Elf64_Ehdr *ehdr = (Elf64_Ehdr *) base;
+                Elf64_Phdr *phdr = (Elf64_Phdr *) (base + ehdr->e_phoff);
+
+                for (int i = 0; i < ehdr->e_phnum; i++) {
+                    const Elf64_Phdr *p = &phdr[i];
+
+                    if (pt_load_only_arg && p->p_type != PT_LOAD) {
+                        continue;
+                    }
+
+                    u8t *seg_start = base + p->p_vaddr;
+                    sizet seg_size = p->p_memsz;
+
+                    if ((p->p_flags & PF_X) && !seg.exec.start) {
+                        seg.exec.start = seg_start;
+                        seg.exec.size = seg_size;
+                    }
+
+                    if ((p->p_flags & PF_R) && !(p->p_flags & PF_W) && !(p->p_flags & PF_X)) {
+                        if (seg.ro_count < MAX_RO_SEGMENTS) {
+                            seg.ro[seg.ro_count].start = seg_start;
+                            seg.ro[seg.ro_count].size = seg_size;
+                            seg.ro_count++;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /*
+    else if (mode_arg == SEG_SEARCH_MAPS_DLINFO) {
+        // --- find exec segment via /proc/self/maps ---
+        FILE *maps = fopen("/proc/self/maps", "r");
+        if (!maps) return seg;
+
+        u8t *exec_addr = nullptr;
+        char line[512];
+        while (fgets(line, sizeof(line), maps)) {
+            unsigned long start, end;
+            char perms[5], path[256] = {0};
+
+            if (sscanf(line, "%lx-%lx %4s %*x %*x:%*x %*d %255s",
+                       &start, &end, perms, path) < 3)
+                continue;
+
+            if (strstr(path, lib_name_arg) && perms[2] == 'x') {
+                exec_addr = (u8t *) start;
+                break;
+            }
+        }
+        fclose(maps);
+
+        if (exec_addr) {
+            Dl_info info;
+            if (dlinfo(exec_addr, 2, &info) == 0 && info.dli_fbase) {
+                u8t *base = (u8t *) info.dli_fbase;
+                Elf64_Ehdr *ehdr = (Elf64_Ehdr *) base;
+                Elf64_Phdr *phdr = (Elf64_Phdr *) (base + ehdr->e_phoff);
+
+                for (int i = 0; i < ehdr->e_phnum; i++) {
+                    const Elf64_Phdr *p = &phdr[i];
+
+                    // skip non-PT_LOAD if pt_load_only_arg flag is set
+                    if (pt_load_only_arg && p->p_type != PT_LOAD) continue;
+
+                    u8t *seg_start = base + p->p_vaddr;
+                    sizet seg_size = p->p_memsz;
+
+                    if ((p->p_flags & PF_X) && !seg.exec.start) {
+                        seg.exec.start = seg_start;
+                        seg.exec.size = seg_size;
+                    }
+
+                    if ((p->p_flags & PF_R) && !(p->p_flags & PF_W) && !(p->p_flags & PF_X)) {
+                        if (seg.ro_count < MAX_RO_SEGMENTS) {
+                            seg.ro[seg.ro_count].start = seg_start;
+                            seg.ro[seg.ro_count].size = seg_size;
+                            seg.ro_count++;
+                        }
+                    }
+                }
+            }
+        }
+    }
+     */
+
+    return seg;
+}
+

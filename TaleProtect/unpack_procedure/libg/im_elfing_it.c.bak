@@ -1,0 +1,421 @@
+#include "im_elfing_it.h"
+#include "sections_metadata.h"
+#include <global_common/common.h>
+#include "aes-whitebox/aes_whitebox.h"
+#include "im_elfing_it.h"
+#include <global_common/common.h>
+#include "aes-whitebox/aes_whitebox.h"
+#include <dlfcn.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+section_metadata_t sections[] = {
+        /* .rodata */
+//        {"", 0x16fe60, 0xff920, { 0xab, 0x1a, 0xf2, 0x59, 0x3e, 0x16, 0xe8, 0x8c, 0x69, 0x6c, 0x5d, 0xeb, 0xda, 0x28, 0x0c, 0xa7}},
+//        {"", 0x16fe60, 0xff920,  {0xff, 0xfa, 0xf2, 0x59, 0x3e, 0x16, 0xe8, 0x8c, 0x69, 0x6c, 0x5d, 0xeb, 0xda, 0x28, 0x0c, 0xa7}},
+        {"rodata", 0x16fe60, 0xff920, { 0xa0, 0x0a, 0xf2, 0x59, 0x3e, 0x16, 0xe8, 0x8c, 0x69, 0x6c, 0x5d, 0xeb, 0xda, 0x28, 0x00, 0x00}},
+        /* .text */
+        {"text",   0x3fc620, 0xb67200, {0x6f, 0xf8, 0xaf, 0xf1, 0x70, 0xc3, 0x7d, 0x1b, 0xbd, 0xef, 0x11, 0xff, 0xa6, 0xf9, 0xaa, 0xc1}},
+};
+
+size_t sections_count = sizeof(sections) / sizeof(sections[0]);
+
+// im_elfing_it_patch.c
+// Drop-in implementation. Assumes sections[] + sections_count from sections_metadata.h
+// sections[0] = rodata, sections[1] = text
+
+#include "im_elfing_it.h"
+#include "sections_metadata.h"
+#include <global_common/common.h>
+#include "aes-whitebox/aes_whitebox.h"
+
+#include <dlfcn.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <time.h>
+#include <stdio.h>
+#include <inttypes.h>
+
+static double now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+
+static void log_nonce(const uint8_t nonce[16]) {
+    char buf[3 * 16 + 1];
+    char *p = buf;
+    for (int i = 0; i < 16; ++i) {
+        int wrote = sprintf(p, "%02x ", nonce[i]);
+        p += wrote;
+    }
+    *p = '\0';
+    LOGI("      %s", buf);
+}
+
+
+static void hexdump(const uint8_t *nonce, sizet size_arg) {
+    char buf[3 * size_arg + 1];
+    char *p = buf;
+    for (sizet i = 0; i < size_arg; ++i) {
+        int wrote = sprintf(p, "%02x ", nonce[i]);
+        p += wrote;
+    }
+    *p = '\0';
+    LOGI(" >    %s", buf);
+}
+
+static void xor_buffer(uint8_t *buf, size_t len, const uint8_t key16[16]) {
+    size_t i = 0;
+    // unrolled-ish loop: process 16-bytes blocks
+    for (; i + 16 <= len; i += 16) {
+        buf[i + 0] ^= key16[0];
+        buf[i + 1] ^= key16[1];
+        buf[i + 2] ^= key16[2];
+        buf[i + 3] ^= key16[3];
+        buf[i + 4] ^= key16[4];
+        buf[i + 5] ^= key16[5];
+        buf[i + 6] ^= key16[6];
+        buf[i + 7] ^= key16[7];
+        buf[i + 8] ^= key16[8];
+        buf[i + 9] ^= key16[9];
+        buf[i + 10] ^= key16[10];
+        buf[i + 11] ^= key16[11];
+        buf[i + 12] ^= key16[12];
+        buf[i + 13] ^= key16[13];
+        buf[i + 14] ^= key16[14];
+        buf[i + 15] ^= key16[15];
+    }
+    for (; i < len; ++i) buf[i] ^= key16[i & 15];
+}
+
+static void hexdump_log(const char *tag, const uint8_t *buf, size_t len) {
+    // print up to len bytes (keeps log short)
+    size_t show = len;
+    LOGI("%s (len=%zu):", tag, len);
+    char line[256];
+    line[0] = 0;
+    size_t pos = 0;
+    for (size_t i = 0; i < show; ++i) {
+        int n = snprintf(line + pos, sizeof(line) - pos, "%02x%s", buf[i],
+                         (i + 1 == show) ? "" : " ");
+        pos += (n > 0) ? n : 0;
+        if (pos > (sizeof(line) - 64)) {
+            LOGI("%s", line);
+            pos = 0;
+            line[0] = 0;
+        }
+    }
+    if (pos > 0) LOGI("%s", line);
+}
+
+static void whitebox_roundtrip_test(const uint8_t nonce[16]) {
+    const char *msg = "HelloWhiteBoxAES!";       // 17 bytes incl NUL
+    size_t len = strlen(msg) + 1;               // include terminating NUL like your example
+    uint8_t *plain = (uint8_t *) malloc(len);
+    uint8_t *cipher = (uint8_t *) malloc(len);
+    uint8_t *dec = (uint8_t *) malloc(len);
+
+    if (!plain || !cipher || !dec) {
+        LOGE("[WBTEST] malloc failed");
+        free(plain);
+        free(cipher);
+        free(dec);
+        return;
+    }
+
+    memcpy(plain, msg, len);
+
+    LOGI("[WBTEST] Plaintext:");
+    hexdump_log("plain", plain, len);
+
+    // encrypt
+    double t0 = 0.0, t1 = 0.0;
+    struct timespec ts1, ts2;
+    clock_gettime(CLOCK_MONOTONIC, &ts1);
+    aes_whitebox_encrypt_ctr(nonce, plain, len, cipher);
+    clock_gettime(CLOCK_MONOTONIC, &ts2);
+    t0 = (ts2.tv_sec - ts1.tv_sec) * 1000.0 + (ts2.tv_nsec - ts1.tv_nsec) / 1e6;
+
+    LOGI("[WBTEST] Ciphertext (after aes_whitebox_encrypt_ctr) elapsed: %.3f ms", t0);
+    hexdump_log("cipher", cipher, len);
+
+    // decrypt
+    clock_gettime(CLOCK_MONOTONIC, &ts1);
+//    aes_whitebox_decrypt_ctr(nonce, cipher, len, dec);
+    aes_whitebox_decrypt_ctr(nonce, cipher, len, dec);
+    clock_gettime(CLOCK_MONOTONIC, &ts2);
+    t1 = (ts2.tv_sec - ts1.tv_sec) * 1000.0 + (ts2.tv_nsec - ts1.tv_nsec) / 1e6;
+
+    LOGI("[WBTEST] Decryption elapsed: %.3f ms", t1);
+    hexdump_log("decrypted", dec, len);
+
+    if (memcmp(plain, dec, len) == 0) {
+        LOGI("[WBTEST] ✅ round-trip SUCCESS: decrypted == original");
+    } else {
+        LOGE("[WBTEST] ❌ round-trip FAILED: decrypted != original");
+        // print first mismatch index
+        for (size_t i = 0; i < len; ++i) {
+            if (plain[i] != dec[i]) {
+                LOGE("[WBTEST] mismatch at %zu: plain=0x%02x dec=0x%02x", i, plain[i], dec[i]);
+                break;
+            }
+        }
+    }
+
+    free(plain);
+    free(cipher);
+    free(dec);
+}
+
+static void large_roundtrip_test(void *pc_arg) {
+    const size_t test_len = 0xFF920; // requested length
+    LOGI("[BIGTEST] Starting large round-trip test, len=0x%zx", test_len);
+
+    Dl_info info;
+    if (dladdr(pc_arg, &info) == 0) {
+        LOGE("[BIGTEST] dladdr() failed for pc_arg %p", pc_arg);
+        return;
+    }
+    uintptr_t base = (uintptr_t) info.dli_fbase;
+    LOGI("[BIGTEST] library base: %p (%s)", (void *) base,
+         info.dli_fname ? info.dli_fname : "(unknown)");
+
+    if (sections_count == 0) {
+        LOGE("[BIGTEST] no sections metadata available");
+        return;
+    }
+
+    // Use sections[0] (rodata) as requested
+    section_metadata_t *sec = &sections[0];
+    const char *sname = (sec->name && sec->name[0]) ? sec->name : ".rodata";
+    size_t sec_size = (size_t) sec->size;
+    uintptr_t sec_addr = base + sec->offset;
+    uint8_t *mem_ptr = (uint8_t *) sec_addr;
+
+    LOGI("[BIGTEST] target section: %s at %p size=0x%zx", sname, (void *) mem_ptr, sec_size);
+    if (sec_size < test_len) {
+        LOGE("[BIGTEST] section too small: have 0x%zx, need 0x%zx", sec_size, test_len);
+        return;
+    }
+
+    // Allocate buffers
+    uint8_t *plain = (uint8_t *) malloc(test_len);
+    uint8_t *enc = (uint8_t *) malloc(test_len);
+    uint8_t *dec = (uint8_t *) malloc(test_len);
+    if (!plain || !enc || !dec) {
+        LOGE("[BIGTEST] malloc failed (plain=%p enc=%p dec=%p)", plain, enc, dec);
+        free(plain);
+        free(enc);
+        free(dec);
+        return;
+    }
+
+    // Copy ciphertext from memory into plain (we treat 'plain' as input to encrypt)
+    double t0 = now_ms();
+    memcpy(plain, mem_ptr, test_len);
+    double t_copy = now_ms() - t0;
+    LOGI("[BIGTEST] copied %zu bytes from mem (%.2f ms)", test_len, t_copy);
+
+    // Show first bytes of source
+    hexdump_log("[BIGTEST] source (mem) first bytes", plain, 32);
+
+    // Encrypt with whitebox (this should produce something — note: this is the same routine used to produce packed files)
+    double t_enc_start = now_ms();
+    aes_whitebox_encrypt_ctr(sec->nonce, plain, test_len, enc);
+    double t_enc = now_ms() - t_enc_start;
+    LOGI("[BIGTEST] aes_whitebox_encrypt_ctr elapsed: %.2f ms", t_enc);
+
+    hexdump_log("[BIGTEST] ciphertext first bytes", enc, 32);
+
+    // Decrypt
+    double t_dec_start = now_ms();
+    aes_whitebox_decrypt_ctr(sec->nonce, enc, test_len, dec);
+    double t_dec = now_ms() - t_dec_start;
+    LOGI("[BIGTEST] aes_whitebox_decrypt_ctr elapsed: %.2f ms", t_dec);
+
+    hexdump_log("[BIGTEST] decrypted first bytes", dec, 32);
+
+    // Compare
+    if (memcmp(plain, dec, test_len) == 0) {
+        LOGI("[BIGTEST] ✅ round-trip SUCCESS for %zu bytes (enc->dec == original)", test_len);
+    } else {
+        LOGE("[BIGTEST] ❌ round-trip FAILED for %zu bytes", test_len);
+        // find first mismatch
+        size_t bad_idx = SIZE_MAX;
+        for (size_t i = 0; i < test_len; ++i) {
+            if (plain[i] != dec[i]) {
+                bad_idx = i;
+                break;
+            }
+        }
+        if (bad_idx == SIZE_MAX) {
+            LOGE("[BIGTEST] mismatch but could not find index (weird)");
+        } else {
+            LOGE("[BIGTEST] first mismatch at 0x%zx: mem=0x%02x dec=0x%02x", bad_idx,
+                 plain[bad_idx], dec[bad_idx]);
+            // print neighborhood
+            size_t start = (bad_idx >= 16) ? (bad_idx - 16) : 0;
+            size_t end = (bad_idx + 16 < test_len) ? (bad_idx + 16) : (test_len - 1);
+            char info_line[256];
+            // print mem bytes around
+            LOGI("[BIGTEST] mem around mismatch:");
+            size_t show = end - start + 1;
+            for (size_t i = start; i <= end; ++i) {
+                if ((i - start) % 16 == 0) fprintf(stderr, "\n");
+                fprintf(stderr, "%02x ", plain[i]);
+            }
+            fprintf(stderr, "\n");
+            LOGI("[BIGTEST] dec around mismatch:");
+            for (size_t i = start; i <= end; ++i) {
+                if ((i - start) % 16 == 0) fprintf(stderr, "\n");
+                fprintf(stderr, "%02x ", dec[i]);
+            }
+            fprintf(stderr, "\n");
+        }
+    }
+
+    free(plain);
+    free(enc);
+    free(dec);
+    LOGI("[BIGTEST] done");
+}
+
+ATTR_USED extern void im_elfing_it(u32t magic, void *pc_arg) {
+    LOGE(">>> im_elfing_it() called | magic: 0x%x | pc_arg: %p", magic, pc_arg);
+//    whitebox_roundtrip_test(sections[0].nonce);
+//    large_roundtrip_test(pc_arg);
+
+    Dl_info info;
+    if (dladdr(pc_arg, &info) == 0) {
+        LOGE("[!] dladdr() failed for pc_arg %p", pc_arg);
+        return;
+    }
+
+    uintptr_t base = (uintptr_t) info.dli_fbase;
+    LOGI("[*] Library base: %p (%s)", (void *) base, info.dli_fname ? info.dli_fname : "(unknown)");
+
+    int pagesz = getpagesize();
+    LOGI("[*] pagesize = %d", pagesz);
+
+    // Expect index 0 = rodata, 1 = text (user requested)
+    for (size_t idx = 0; idx < sections_count; ++idx) {
+        LOGI("idx->%zu", idx);
+        section_metadata_t *sec = &sections[idx];
+        const char *sname = (sec->name && sec->name[0]) ? sec->name : (idx == 0 ? ".rodata"
+                                                                                : ".text");
+        uintptr_t virt = base + sec->offset;
+        uint8_t *section_ptr = (uint8_t *) virt;
+        size_t size = (size_t) sec->size;
+
+        LOGI("[*] Section %zu/%zu -> %s", idx + 1, sections_count, sname);
+        LOGI("    virt_addr: %p", (void *) section_ptr);
+        LOGI("    size     : 0x%zx (%zu)", size, size);
+        LOGI("    offset   : 0x%zx", (size_t) sec->offset);
+        LOGI("    nonce    :");
+        log_nonce(sec->nonce);
+
+        // page alignment
+        uintptr_t page_start = (uintptr_t) section_ptr & ~((uintptr_t) pagesz - 1);
+        uintptr_t page_end =
+                ((uintptr_t) section_ptr + size + pagesz - 1) & ~((uintptr_t) pagesz - 1);
+        size_t page_len = page_end - page_start;
+        LOGI("    page_start: %p, page_len: 0x%zx", (void *) page_start, page_len);
+
+        // copy to heap tmp
+        double t0 = now_ms();
+        uint8_t *tmp = (uint8_t *) malloc(size);
+        if (!tmp) {
+            LOGE("[!] malloc(%zu) failed for %s", size, sname);
+            continue;
+        }
+        memcpy(tmp, section_ptr, size);
+        double t_copy = now_ms() - t0;
+        LOGI("    copied original -> tmp (%.2f ms)", t_copy);
+
+        if (idx == 0) { // index 0 == rodata => whitebox decrypt
+            LOGI("    method: whitebox AES-CTR decrypt (.rodata)");
+            double t_de_start = now_ms();
+            uint8_t *tmp_out = (uint8_t *) malloc(size);
+            aes_whitebox_decrypt_ctr(sec->nonce, tmp, size, tmp_out); // in-place
+            double t_de = now_ms() - t_de_start;
+            LOGI("    whitebox decrypt done (%.2f ms)", t_de);
+
+            LOGI("encrypted rodata:");
+            hexdump(section_ptr, 32);
+            LOGI("decrypted rodata:");
+            hexdump(tmp_out, 32);
+
+            // make pages RW (no exec)
+            if (mprotect((void *) page_start, page_len, PROT_READ | PROT_WRITE) != 0) {
+                LOGE("[!] mprotect -> RW failed for %s", sname);
+                free(tmp_out);
+                continue;
+            }
+            LOGI("    mprotect -> RW OK");
+
+            double t_wr_start = now_ms();
+            memcpy(section_ptr, tmp_out, size);
+            double t_wr = now_ms() - t_wr_start;
+            LOGI("    wrote decrypted bytes back (%.2f ms)", t_wr);
+
+            // restore to read-only (no exec)
+            if (mprotect((void *) page_start, page_len, PROT_READ) != 0) {
+                LOGE("[!] mprotect restore -> R failed for %s", sname);
+            } else {
+                LOGI("    restored protection -> R (no X)");
+            }
+
+            free(tmp_out);
+            free(tmp);
+            LOGI("    freed tmp for %s", sname);
+        } else if (idx == 1) { // index 1 == text => xor with nonce
+            LOGI("    method: XOR with 16-byte repeating nonce (text)");
+
+            LOGI("tmp buffer before xor:");
+            hexdump(tmp, 64);
+            double t_xor_start = now_ms();
+            xor_buffer(tmp, size, sec->nonce);
+            double t_xor = now_ms() - t_xor_start;
+            LOGI("    XOR complete (%.2f ms)", t_xor);
+
+            // make pages writable+executable for .text patching
+            if (mprotect((void *) page_start, page_len, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+                LOGE("[!] mprotect -> RWX failed for %s", sname);
+                free(tmp);
+                continue;
+            }
+            LOGI("    mprotect -> RWX OK");
+
+            double t_wr_start = now_ms();
+            LOGI("encrypted:");
+            hexdump(section_ptr, 64);
+            memcpy(section_ptr, tmp, size);
+            LOGI("decrypted:");
+            hexdump(tmp, 64);
+            double t_wr = now_ms() - t_wr_start;
+            LOGI("    wrote XORed bytes back (%.2f ms)", t_wr);
+
+            // restore RX
+            if (mprotect((void *) page_start, page_len, PROT_READ | PROT_EXEC) != 0) {
+                LOGE("[!] mprotect restore -> RX failed for %s", sname);
+            } else {
+                LOGI("    restored protection -> RX");
+            }
+
+            free(tmp);
+            LOGI("    freed tmp for %s", sname);
+        } else {
+            LOGW("[!] Unknown index %zu - skipping", idx);
+            free(tmp);
+        }
+
+        LOGI("    finished %s", sname);
+    }
+
+    LOGE(">>> im_elfing_it() finished");
+}

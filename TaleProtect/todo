@@ -1,0 +1,11 @@
+1. maybe inline your hardcoded decryptors.
+2. do more checks on parent process.
+[+] *3. Add gadget(s) config hash check [very important!!!!] ( + (done) + )
+[half-done] 4. obfuscate all literals, including numerical.
+5. chain-depend all routines like domino's so in case one fails the whole code fails with it too.
+6. add watchdogs in it.
+7. add thread monitors.
+8. add quiz based heartbeats
+[maybe] 9. maybe add back the server update feature?
+10. use some inotify
+11. depend main thread on other threads and viceversa

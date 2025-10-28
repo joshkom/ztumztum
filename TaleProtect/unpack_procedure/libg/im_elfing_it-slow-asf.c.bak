@@ -1,0 +1,112 @@
+#include "im_elfing_it.h"
+#include "sections_metadata.h"
+#include <global_common/common.h>
+#include "aes-whitebox/aes_whitebox.h"
+#include "im_elfing_it.h"
+#include <global_common/common.h>
+#include "aes-whitebox/aes_whitebox.h"
+#include <dlfcn.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+section_metadata_t sections[] = {
+        /* .rodata */
+        {"", 0x16fe60, 0xff920,  {0xff, 0xfa, 0xf2, 0x59, 0x3e, 0x16, 0xe8, 0x8c, 0x69, 0x6c, 0x5d, 0xeb, 0xda, 0x28, 0x0c, 0xa7}},
+        /* .text */
+        {"", 0x3fc620, 0xb67200, {0x6f, 0xf8, 0xaf, 0xf1, 0x70, 0xc3, 0x7d, 0x1b, 0xbd, 0xef, 0x11, 0xff, 0xa6, 0xf9, 0xaa, 0xc1}},
+};
+
+size_t sections_count = sizeof(sections) / sizeof(sections[0]);
+
+#include "im_elfing_it.h"
+#include "sections_metadata.h"
+#include <global_common/common.h>
+#include "aes-whitebox/aes_whitebox.h"
+#include <dlfcn.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+ATTR_USED extern void im_elfing_it(u32t magic, void *pc_arg) {
+    LOGE(">>> im_elfing_it() called | magic: 0x%x | pc_arg: %p", magic, pc_arg);
+
+    Dl_info info;
+    if (dladdr(pc_arg, &info) == 0) {
+        LOGE("[!] dladdr() failed for pc_arg %p", pc_arg);
+        return;
+    }
+
+    uintptr_t base = (uintptr_t)info.dli_fbase;
+    LOGI("[*] Library base determined via dladdr: %p (%s)", info.dli_fbase, info.dli_fname);
+
+    for (size_t i = 0; i < sections_count; i++) {
+        section_metadata_t *sec = &sections[i];
+        uint8_t *section_ptr = (uint8_t*)(base + sec->offset);
+        size_t size = sec->size;
+
+        LOGI("[*] Processing section %zu/%zu: %s", i + 1, sections_count, sec->name);
+        LOGI("    - Section virtual address: %p", section_ptr);
+        LOGI("    - Section size: 0x%zx bytes", size);
+
+        // Page-align for mprotect
+        uintptr_t page_start = (uintptr_t)section_ptr & ~(getpagesize() - 1);
+        size_t page_len = ((uintptr_t)section_ptr + size - page_start + getpagesize() - 1) & ~(getpagesize() - 1);
+
+        LOGI("    - Page-aligned start: %p | length for mprotect: 0x%zx", (void*)page_start, page_len);
+
+        // Temporarily make section writable
+        if (mprotect((void*)page_start, page_len, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+            LOGE("[!] mprotect failed for section %s", sec->name);
+            continue;
+        }
+        LOGI("    - mprotect successful (RWX)");
+
+        // Allocate temporary buffer
+        uint8_t *tmp = (uint8_t*)malloc(size);
+        if (!tmp) {
+            LOGE("[!] Failed to allocate temporary buffer for section %s", sec->name);
+            continue;
+        }
+        LOGI("    - Temporary buffer allocated at %p", tmp);
+
+        // Copy original section bytes into tmp buffer (may speed up decryption)
+        memcpy(tmp, section_ptr, size);
+        LOGI("    - Original section bytes copied to temporary buffer");
+
+        // Show nonce
+        LOGI("    - Using nonce:");
+        char nonce_str[64] = {0};
+        for (int n = 0; n < 16; n++) {
+            char tmp_str[8];
+            snprintf(tmp_str, sizeof(tmp_str), "%02x ", sec->nonce[n]);
+            strncat(nonce_str, tmp_str, sizeof(nonce_str) - strlen(nonce_str) - 1);
+        }
+        LOGI("      %s", nonce_str);
+
+        // Decrypt
+        LOGI("    - Starting decryption...");
+        aes_whitebox_decrypt_ctr(sec->nonce, tmp, size, tmp);
+        LOGI("    - Decryption complete");
+
+        // Copy decrypted data back to section
+        memcpy(section_ptr, tmp, size);
+        LOGI("    - Decrypted bytes written back to section memory");
+
+        free(tmp);
+        LOGI("    - Temporary buffer freed");
+
+        // Restore original protection
+        if (mprotect((void*)page_start, page_len, PROT_READ | PROT_EXEC) != 0) {
+            LOGE("[!] Failed to restore protection for section %s", sec->name);
+        } else {
+            LOGI("    - Section protection restored to RX");
+        }
+
+        LOGI("[*] Section %s decrypted successfully\n", sec->name);
+    }
+
+    LOGE(">>> im_elfing_it() finished decrypting all sections");
+}

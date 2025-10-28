@@ -1,0 +1,12 @@
+//
+// Created by johan on 10.10.25.
+//
+
+#ifndef TALESTARS_V63_322_NATIVE_LIBRARY_DIRECTORY_ENTRIES_PROTECTION_H
+#define TALESTARS_V63_322_NATIVE_LIBRARY_DIRECTORY_ENTRIES_PROTECTION_H
+
+void native_library_directory_entries_protection(
+        void
+);
+
+#endif //TALESTARS_V63_322_NATIVE_LIBRARY_DIRECTORY_ENTRIES_PROTECTION_H

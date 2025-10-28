@@ -1,0 +1,142 @@
+#include "hook_detector.h"
+
+#include <global_common/common.h>
+#include <unstdmemory_compat.h>
+
+static const uint32_t AARCH64_BL_MASK      = 0xFC000000u; /* bits[31:26] */
+static const uint32_t AARCH64_BL_VALUE     = 0x94000000u; /* BL imm26 */
+
+static const uint32_t AARCH64_BRBLR_MASK   = 0xFFFFFC1Fu; /* mask for BR/BLR opcodes */
+static const uint32_t AARCH64_BLR_VALUE    = 0xD63F0000u; /* BLR Xn */
+static const uint32_t AARCH64_BR_VALUE     = 0xD61F0000u; /* BR Xn */
+
+/* ADRP: top bits 31..24 have pattern 0b10010000 (0x90) and some flags in lower bits.
+ * Use mask 0x9F000000 with value 0x90000000 to detect ADRP/ADR-like PC-rel instructions.
+ * (This is a common conservative pattern used for detecting ADRP instructions.)
+ */
+static const uint32_t AARCH64_ADRP_MASK    = 0x9F000000u;
+static const uint32_t AARCH64_ADRP_VALUE   = 0x90000000u;
+
+/* Safe read of 4 bytes from potentially unaligned address (little-endian) */
+static inline uint32_t load_u32_le(const void *p)
+{
+    uint32_t w;
+    unstdmemory_compat_memcpy(&w, p, sizeof(w));
+    return w;
+}
+
+/* Decode BL imm26 -> compute sign-extended 26-bit immediate * 4 and target address.
+ * instr is the 32-bit word (little-endian native).
+ * pc is the instruction address (address of the 4-byte word).
+ * returns the absolute target address.
+ */
+static inline uintptr_t bl_target_from_instr(uint32_t instr, uintptr_t pc)
+{
+    /* imm26 is bits[25:0] (but shifted left 2) and sign-extended from 26 bits */
+    int32_t imm26 = (int32_t)(instr & 0x03FFFFFFu);
+    /* sign-extend 26-bit to 32-bit signed */
+    if (imm26 & (1 << 25)) { /* negative */
+        imm26 |= ~((1 << 26) - 1);
+    }
+    /* multiply by 4 (left shift 2) */
+    int64_t offset = ((int64_t)imm26) << 2;
+    /* PC for AArch64 branch immediates is address of current instruction */
+    return (uintptr_t)((int64_t)pc + offset);
+}
+
+
+bool hook_detector_detect_trampoline_like(const void *func_arg, size_t scan_len_arg, size_t cap_limit_arg, tramp_info_t *out_arg) {
+    if (!func_arg || scan_len_arg < 4) return false;
+    if (!out_arg) return false;
+
+    if (cap_limit_arg == 0) cap_limit_arg = 256;
+    if (scan_len_arg > cap_limit_arg) scan_len_arg = cap_limit_arg;
+    scan_len_arg &= ~((size_t)3); /* round down to multiple of 4 */
+
+    const uint8_t *base = (const uint8_t *)func_arg;
+    unstdmemory_compat_memset(out_arg, 0, sizeof(*out_arg));
+
+    /* Scan each 4-byte aligned instruction within the scan_len_arg */
+    for (size_t off = 0; off + 4 <= scan_len_arg; off += 4) {
+        const void *ptr = base + off;
+        uint32_t w = load_u32_le(ptr);
+
+        /* Check BL imm26 */
+        if ((w & AARCH64_BL_MASK) == AARCH64_BL_VALUE) {
+            out_arg->found = true;
+            out_arg->type = TR_BL;
+            out_arg->offset = off;
+            out_arg->word = w;
+            out_arg->target = bl_target_from_instr(w, (uintptr_t)ptr);
+            return true;
+        }
+
+        /* Check BLR / BR */
+        if ((w & AARCH64_BRBLR_MASK) == AARCH64_BLR_VALUE) {
+            out_arg->found = true;
+            out_arg->type = TR_BLR;
+            out_arg->offset = off;
+            out_arg->word = w;
+            out_arg->target = 0;
+            return true;
+        }
+        if ((w & AARCH64_BRBLR_MASK) == AARCH64_BR_VALUE) {
+            out_arg->found = true;
+            out_arg->type = TR_BR;
+            out_arg->offset = off;
+            out_arg->word = w;
+            out_arg->target = 0;
+            return true;
+        }
+
+        /* Check ADRP followed shortly by BR/BLR (trampoline pattern).
+         * If we see ADRP at this offset, check the next 1..2 instructions for BR/BLR.
+         */
+        if ((w & AARCH64_ADRP_MASK) == AARCH64_ADRP_VALUE) {
+            /* look ahead 1 and 2 instructions */
+            for (size_t k = 4; k <= 8 && off + k + 4 <= scan_len_arg; k += 4) {
+                uint32_t w2 = load_u32_le(base + off + k);
+                if ((w2 & AARCH64_BRBLR_MASK) == AARCH64_BLR_VALUE) {
+                    out_arg->found = true;
+                    out_arg->type = TR_ADRP_BR;
+                    out_arg->offset = off; /* start of ADRP */
+                    out_arg->word = w;
+                    out_arg->target = 0;
+                    return true;
+                }
+                if ((w2 & AARCH64_BRBLR_MASK) == AARCH64_BR_VALUE) {
+                    out_arg->found = true;
+                    out_arg->type = TR_ADRP_BR;
+                    out_arg->offset = off;
+                    out_arg->word = w;
+                    out_arg->target = 0;
+                    return true;
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
+
+void hook_detector_print_tramp_info(const void *func_arg, const tramp_info_t *ti_arg) {
+    if (!ti_arg) return;
+    if (!ti_arg->found) {
+        LOGI("No trampoline-like pattern found at %p", func_arg);
+        return;
+    }
+
+    const char *name = "UNKNOWN";
+    switch (ti_arg->type) {
+        case TR_BL:       name = "BL"; break;
+        case TR_BLR:      name = "BLR"; break;
+        case TR_BR:       name = "BR"; break;
+        case TR_ADRP_BR:  name = "ADRP+BR-like"; break;
+        default: break;
+    }
+    LOGI("Trampoline-like: %s at %p+%zu (word=0x%08x)", name, func_arg, ti_arg->offset, ti_arg->word);
+    if (ti_arg->type == TR_BL) {
+        LOGI(" -> BL target resolved to 0x%zx", (size_t)ti_arg->target);
+    }
+}

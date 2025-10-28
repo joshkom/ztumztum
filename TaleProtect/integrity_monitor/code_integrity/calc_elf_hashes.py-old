@@ -1,0 +1,39 @@
+#!/usr/bin/env python3
+import sys
+import hashlib
+
+def hash_fixed(file_path, count):
+    md5 = hashlib.md5()
+    sha256 = hashlib.sha256()
+    chunk_size = 1024*1024  # 1 MB chunks
+
+    with open(file_path, 'rb') as f:
+        remaining = count
+        while remaining > 0:
+            read_size = min(remaining, chunk_size)
+            data = f.read(read_size)
+            if not data:
+                break
+            md5.update(data)
+            sha256.update(data)
+            remaining -= len(data)
+
+    return md5.hexdigest(), sha256.hexdigest()
+
+if __name__ == "__main__":
+    if len(sys.argv) < 3:
+        print("Usage: python3 c5.py <file> <bytes_to_hash>")
+        sys.exit(1)
+
+    file_path = sys.argv[1]
+    try:
+        COUNT = int(sys.argv[2], 0)  # auto-detect hex or decimal
+    except ValueError:
+        print("Invalid number of bytes:", sys.argv[2])
+        sys.exit(1)
+
+    md5sum, sha256sum = hash_fixed(file_path, COUNT)
+    print(f"[*] Hashing first 0x{COUNT:x} bytes of {file_path}")
+    print("MD5   :", md5sum)
+    print("SHA256:", sha256sum)
+

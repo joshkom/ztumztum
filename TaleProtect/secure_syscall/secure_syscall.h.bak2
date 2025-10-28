@@ -1,0 +1,196 @@
+#ifndef TALESTARS_V63_322_SECURE_SYSCALL_H
+#define TALESTARS_V63_322_SECURE_SYSCALL_H
+
+#include <unstdinttypes.h>
+#include <global_common/common.h>
+
+#include <sys/mman.h>
+#include <stdarg.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <syscall.h>
+
+#include <unstdinttypes.h>
+#include <unstdmemory_compat.h>
+#include <TaleProtect/func_resolver/func_resolver_3000.h>
+#include <TaleProtect/obfuscators/literal_obfuscator.h>
+#include <TaleProtect/demolisher/stackoverflower.h>
+#include <threads.h>
+
+// ---- prelude for (svc #0 ; ret) ----
+#define _SECURE_SYSCALL_STUB_SIZE_BYTES 8
+#define _SECURE_SYSCALL_KEY_SIZE_BYTES 8
+typedef struct secure_syscall_stub_ctx_s {
+    u8t encrypted_stub[_SECURE_SYSCALL_STUB_SIZE_BYTES];
+    u8t key[_SECURE_SYSCALL_KEY_SIZE_BYTES];
+} secure_syscall_stub_ctx_t;
+extern secure_syscall_stub_ctx_t secure_syscall_stub_ctx;
+
+// ================== [secure syscall :: v1 (deprecated)] ==================
+//! [deprecated]
+
+//#ifdef POTATOSHIELD_OVERKILL
+//typedef struct {
+//    u8t *prelude_ptr;
+//    size_t size;
+//    volatile int *running;
+//} stub_info_t;
+//
+//void *stub_self_heal_thread(void *arg) {
+//    stub_info_t *stub_info_ptr = (stub_info_t *) arg;
+//    while (*(stub_info_ptr->running)) {
+//        for (ulong i = 0; i < stub_info_ptr->size; i++)
+//            stub_info_ptr->prelude_ptr[i] = secure_encrypted_stub[i] ^ secure_key[i];
+//        utils_msleep(18 * 1000); /* 18ms */
+//    }
+//    return NULL;
+//}
+//#endif
+
+//FORCE_INLINE uptrt secure_syscall(i32 svc_num_arg, i32 nargs_arg, ...) {
+////    pthread_mutex_lock(&secure_syscall_lock);
+//    if (nargs_arg > 6) {
+//        return -1;
+//    }
+//
+//    svc_num_arg = DEOBF_INT32(svc_num_arg);
+//    nargs_arg = DEOBF_INT32(nargs_arg);
+//
+//    uptrt args[6] = {0};
+//    va_list vl;
+//    va_start(vl, nargs_arg);
+//    for (int i = 0; i < nargs_arg; i++) {
+//        args[i] = va_arg(vl, uptrt);
+//    }
+//    va_end(vl);
+//
+//    u8t *stub_addr = (u8t *) mmapM(
+//            NULL, 8,
+//            PROT_READ | PROT_WRITE,
+//            MAP_ANON | MAP_PRIVATE,
+//            -1, 0
+//    );
+//
+//    if (stub_addr == MAP_FAILED) {
+//        demolisher_stackoverflower();
+//        return -1;
+//    }
+//
+//    for (int word = 0; word < 2; ++word) {
+//        for (int b = 0; b < 4; ++b) {
+//            sizet src_idx = word * 4 + (3 - b);
+//            stub_addr[word * 4 + b] = secure_encrypted_stub[src_idx] ^ secure_key[src_idx];
+//        }
+//    }
+//
+//    __builtin___clear_cache(
+//            (char *) stub_addr,
+//            (char *) (stub_addr + sizeof(secure_encrypted_stub))
+//    );
+//
+//    if (mprotectM(stub_addr, 8, PROT_READ | PROT_EXEC) != 0) {
+//        munmapM(stub_addr, 8);
+//        demolisher_stackoverflower();
+//        return -1;
+//    }
+//
+//#ifdef POTATOSHIELD_OVERKILL
+//    volatile int running = 1;
+//    stub_info_t stub_info = {
+//            stub_addr,
+//            sizeof(secure_encrypted_stub),
+//            &running
+//    };
+//
+//    pthread_t tid;
+//    if (pthread_create(&tid,
+//                       NULL,
+//                       stub_self_heal_thread,
+//                       &stub_info) != 0) {
+//        unstdmemory_compat_memset(stub_addr, 0, 8);
+//        munmap(stub_addr, 8);
+//        return -1;
+//    }
+//#endif
+//
+//    uptrt retval;
+//    asm volatile(
+//            "mov x0, %1\n"
+//            "mov x1, %2\n"
+//            "mov x2, %3\n"
+//            "mov x3, %4\n"
+//            "mov x4, %5\n"
+//            "mov x5, %6\n"
+//
+//            "mov w9, %w7\n"
+//
+//            "ldr x11, =0xA5C3F1D7\n"
+//            "eor x10, x9, x11\n"
+//            "eor x10, x10, x11\n"
+//
+//            "ror x10, x10, #19\n"
+//            "ror x10, x10, #45\n"
+//
+//            "lsl x10, x10, #7\n"
+//            "lsr x10, x10, #7\n"
+//
+//            "ldr x12, =0x37A2B1C4\n"
+//            "add x10, x10, x12\n"
+//            "sub x10, x10, x12\n"
+//
+//            "mov x8, x10\n"
+//
+//            "blr %8\n"
+//            "mov %0, x0\n"
+//            : "=r"(retval)
+//            : "r"(args[0]), "r"(args[1]), "r"(args[2]), "r"(args[3]), "r"(args[4]), "r"(args[5]),
+//    "r"(svc_num_arg), "r"(stub_addr)
+//            : "x0", "x1", "x2", "x3", "x4", "x5", "x8", "x9", "x10", "x11", "x12"
+//            );
+//
+//#ifdef POTATOSHIELD_OVERKILL
+//    running = 0;
+//    pthread_join(tid, NULL);
+//#endif
+//
+//    if (mprotectM(stub_addr, 8, PROT_READ | PROT_WRITE) != 0) {
+//        munmapM(stub_addr, 8);
+//        demolisher_stackoverflower();
+//        return -1;
+//    }
+//
+//    unstdmemory_compat_memset(stub_addr, 0, 8);
+//    munmap(stub_addr, 8);
+//
+////    pthread_mutex_unlock(&secure_syscall_lock);
+//    return retval;
+//}
+
+//! [deprecated]
+//#define secure_syscallM(svc_num_arg, nargs_arg, ...) secure_syscall(OBF_INT32(svc_num_arg), OBF_INT32(nargs_arg), ##__VA_ARGS__)
+#define secure_syscallM(svc_num_arg, nargs_arg, ...) secure_syscall_v2(OBF_INT32(svc_num_arg), OBF_INT32(nargs_arg), ##__VA_ARGS__)
+
+// ================== [secure syscall :: v2] ==================
+#define _SECURE_SYSCALL_V2_MAX_STUBS 18
+typedef struct secure_syscall_v2_ctx_s {
+    u8t *stubs[_SECURE_SYSCALL_V2_MAX_STUBS];
+    pthread_once_t stub_init;
+} secure_syscall_v2_ctx_t;
+extern secure_syscall_v2_ctx_t secure_syscall_v2_ctx;
+
+uptrt secure_syscall_v2(i32 svc_num_arg, i32 nargs_arg, ...);
+
+#define secure_syscall_v2M(svc_num_arg, nargs_arg, ...) secure_syscall_v2(OBF_INT32(svc_num_arg), OBF_INT32(nargs_arg), ##__VA_ARGS__)
+
+// ================== [secure syscall :: lite] ==================
+typedef struct secure_syscall_lite_ctx_s {
+    u8t *stub_addr;
+    pthread_once_t stub_init;
+} secure_syscall_lite_ctx_t;
+extern secure_syscall_lite_ctx_t secure_syscall_lite_ctx;
+
+uptrt secure_syscall_lite(i32 svc_num_arg, i32 nargs_arg, ...);
+
+#define secure_syscall_liteM(svc_num_arg, nargs_arg, ...) secure_syscall_lite(OBF_INT32(svc_num_arg), OBF_INT32(nargs_arg), ##__VA_ARGS__)
+
+#endif //TALESTARS_V63_322_SECURE_SYSCALL_H
